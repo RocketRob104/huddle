@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import threading
+from datetime import datetime
 import tkinter as tk
 from tkinter import ttk, messagebox
 from urllib.error import URLError, HTTPError
@@ -35,6 +36,49 @@ SNES_COLORS = {
     "warning": "#e5b567",      # Soft highlight for status messages
 }
 
+TEAM_METADATA = {
+    # AFC East
+    "Buffalo Bills": {"conference": "AFC", "division": "AFC East"},
+    "Miami Dolphins": {"conference": "AFC", "division": "AFC East"},
+    "New England Patriots": {"conference": "AFC", "division": "AFC East"},
+    "New York Jets": {"conference": "AFC", "division": "AFC East"},
+    # AFC North
+    "Baltimore Ravens": {"conference": "AFC", "division": "AFC North"},
+    "Cincinnati Bengals": {"conference": "AFC", "division": "AFC North"},
+    "Cleveland Browns": {"conference": "AFC", "division": "AFC North"},
+    "Pittsburgh Steelers": {"conference": "AFC", "division": "AFC North"},
+    # AFC South
+    "Houston Texans": {"conference": "AFC", "division": "AFC South"},
+    "Indianapolis Colts": {"conference": "AFC", "division": "AFC South"},
+    "Jacksonville Jaguars": {"conference": "AFC", "division": "AFC South"},
+    "Tennessee Titans": {"conference": "AFC", "division": "AFC South"},
+    # AFC West
+    "Denver Broncos": {"conference": "AFC", "division": "AFC West"},
+    "Kansas City Chiefs": {"conference": "AFC", "division": "AFC West"},
+    "Las Vegas Raiders": {"conference": "AFC", "division": "AFC West"},
+    "Los Angeles Chargers": {"conference": "AFC", "division": "AFC West"},
+    # NFC East
+    "Dallas Cowboys": {"conference": "NFC", "division": "NFC East"},
+    "New York Giants": {"conference": "NFC", "division": "NFC East"},
+    "Philadelphia Eagles": {"conference": "NFC", "division": "NFC East"},
+    "Washington Commanders": {"conference": "NFC", "division": "NFC East"},
+    # NFC North
+    "Chicago Bears": {"conference": "NFC", "division": "NFC North"},
+    "Detroit Lions": {"conference": "NFC", "division": "NFC North"},
+    "Green Bay Packers": {"conference": "NFC", "division": "NFC North"},
+    "Minnesota Vikings": {"conference": "NFC", "division": "NFC North"},
+    # NFC South
+    "Atlanta Falcons": {"conference": "NFC", "division": "NFC South"},
+    "Carolina Panthers": {"conference": "NFC", "division": "NFC South"},
+    "New Orleans Saints": {"conference": "NFC", "division": "NFC South"},
+    "Tampa Bay Buccaneers": {"conference": "NFC", "division": "NFC South"},
+    # NFC West
+    "Arizona Cardinals": {"conference": "NFC", "division": "NFC West"},
+    "Los Angeles Rams": {"conference": "NFC", "division": "NFC West"},
+    "San Francisco 49ers": {"conference": "NFC", "division": "NFC West"},
+    "Seattle Seahawks": {"conference": "NFC", "division": "NFC West"},
+}
+
 # A fallback list of teams so the dropdown always has content even when offline.
 # Performance numbers are intentionally empty so we do not mislead with stale data.
 FALLBACK_TEAM_DATA = {
@@ -48,41 +92,11 @@ FALLBACK_TEAM_DATA = {
         "win_pct": None,
         "streak": None,
         "note": "Press 'Refresh Data' once you are online to pull standings.",
+        "conference": meta["conference"],
+        "division": meta["division"],
+        "conference_rank": None,
     }
-    for name in (
-        "Arizona Cardinals",
-        "Atlanta Falcons",
-        "Baltimore Ravens",
-        "Buffalo Bills",
-        "Carolina Panthers",
-        "Chicago Bears",
-        "Cincinnati Bengals",
-        "Cleveland Browns",
-        "Dallas Cowboys",
-        "Denver Broncos",
-        "Detroit Lions",
-        "Green Bay Packers",
-        "Houston Texans",
-        "Indianapolis Colts",
-        "Jacksonville Jaguars",
-        "Kansas City Chiefs",
-        "Las Vegas Raiders",
-        "Los Angeles Chargers",
-        "Los Angeles Rams",
-        "Miami Dolphins",
-        "Minnesota Vikings",
-        "New England Patriots",
-        "New Orleans Saints",
-        "New York Giants",
-        "New York Jets",
-        "Philadelphia Eagles",
-        "Pittsburgh Steelers",
-        "San Francisco 49ers",
-        "Seattle Seahawks",
-        "Tampa Bay Buccaneers",
-        "Tennessee Titans",
-        "Washington Commanders",
-    )
+    for name, meta in TEAM_METADATA.items()
 }
 
 
@@ -98,9 +112,9 @@ def fetch_json(url: str, timeout: int = 10) -> dict:
     return json.loads(raw_bytes.decode("utf-8"))
 
 
-def _collect_entries(node: dict | list) -> list:
+def _collect_entries(node: dict | list, conference: str | None = None) -> list[tuple[dict, str | None]]:
     """
-    Walk the standings payload and return every list of 'entries' found.
+    Walk the standings payload and return every team entry alongside its conference.
 
     ESPN wraps standings differently over time (sometimes under "children",
     other times under "standings"). This recursive search keeps the parser
@@ -109,27 +123,38 @@ def _collect_entries(node: dict | list) -> list:
     """
     # Allow callers to pass either dicts or lists; treat lists as containers.
     if isinstance(node, list):
-        entries = []
+        paired_entries = []
         for item in node:
-            entries.extend(_collect_entries(item))
-        return entries
+            paired_entries.extend(_collect_entries(item, conference))
+        return paired_entries
 
     if not isinstance(node, dict):
         return []
 
-    entries = []
+    # Determine whether this node represents a conference boundary.
+    current_conference = conference
+    if node.get("isConference"):
+        current_conference = (
+            node.get("abbreviation") or node.get("shortName") or node.get("name") or conference
+        )
+    elif node.get("abbreviation") in {"AFC", "NFC"}:
+        current_conference = node.get("abbreviation")
+    elif node.get("name") in {"American Football Conference", "National Football Conference"}:
+        current_conference = node.get("abbreviation") or node.get("shortName") or node.get("name")
 
-    # If this node already has 'entries', gather them but continue searching
-    # because other branches (e.g., another conference) may contain more teams.
+    paired_entries = []
+
+    # If this node already has 'entries', gather them but continue searching.
     if "entries" in node and isinstance(node["entries"], list):
-        entries.extend(node["entries"])
+        for entry in node["entries"]:
+            paired_entries.append((entry, current_conference))
 
     # Common wrappers: standings, children, groups, leagues, conferences, divisions.
     for key in ("standings", "children", "groups", "leagues", "conferences", "divisions"):
         if key in node:
-            entries.extend(_collect_entries(node[key]))
+            paired_entries.extend(_collect_entries(node[key], current_conference))
 
-    return entries
+    return paired_entries
 
 
 def parse_standings(raw_payload: dict) -> dict:
@@ -142,7 +167,7 @@ def parse_standings(raw_payload: dict) -> dict:
 
     seen_ids = set()
 
-    for entry in entries:
+    for entry, conference in entries:
         team = entry.get("team", {})
         team_id = team.get("id")
 
@@ -157,6 +182,7 @@ def parse_standings(raw_payload: dict) -> dict:
             or " ".join(filter(None, [team.get("location"), team.get("name")])).strip()
             or team.get("name", "Unknown Team")
         )
+        meta = TEAM_METADATA.get(display_name, {})
 
         # Stats arrive as a list of {"name": "...", "value": ...}.
         stats_block = entry.get("stats", [])
@@ -170,6 +196,11 @@ def parse_standings(raw_payload: dict) -> dict:
         points_against = stats.get("pointsAgainst")
         win_pct = stats.get("winPercent")
         streak = display_values.get("streak") or stats.get("streak")
+        seed_raw = stats.get("playoffSeed")
+        try:
+            conference_rank = int(seed_raw) if seed_raw is not None else None
+        except (TypeError, ValueError):
+            conference_rank = None
 
         # Build a friendly record string. Example: "12-5" or "9-7-1" when tied.
         record_text = f"{wins}-{losses}" if ties == 0 else f"{wins}-{losses}-{ties}"
@@ -184,6 +215,9 @@ def parse_standings(raw_payload: dict) -> dict:
             "win_pct": win_pct,
             "streak": streak,
             "note": entry.get("note", {}).get("text"),
+            "conference": conference or meta.get("conference"),
+            "division": meta.get("division"),
+            "conference_rank": conference_rank,
         }
 
     # Returning an empty dict signals to the caller that parsing failed.
@@ -210,10 +244,12 @@ class HuddleApp:
 
         # Data cache: team name -> performance dict.
         self.team_data = dict(FALLBACK_TEAM_DATA)
+        self.showing_standings = False
 
         # Build the interface before we hit the network so the app feels snappy.
         self._build_layout()
         self._populate_dropdown(sorted(self.team_data.keys()))
+        self.display_standings()
 
         # Kick off a background fetch so the UI thread never blocks.
         self._start_background_fetch()
@@ -275,35 +311,35 @@ class HuddleApp:
             style="Snes.TCombobox",
         )
         self.team_dropdown.pack(side="left", padx=(0, 10))
-
-        # Buttons for showing and refreshing data.
-        self.show_button = tk.Button(
-            row,
-            text="Show Team Data",
-            command=self.display_selected_team,
-            bg=SNES_COLORS["purple"],
-            fg="white",
-            activebackground=SNES_COLORS["lavender"],
-            activeforeground="black",
-            relief="flat",
-            padx=12,
-            pady=6,
-        )
-        self.show_button.pack(side="left", padx=(0, 6))
+        self.team_dropdown.bind("<<ComboboxSelected>>", lambda event: self.display_selected_team())
 
         self.refresh_button = tk.Button(
             row,
             text="Refresh Data",
             command=self._start_background_fetch,
-            bg=SNES_COLORS["dark_gray"],
-            fg="white",
-            activebackground=SNES_COLORS["lavender"],
-            activeforeground="black",
+            bg=SNES_COLORS["lavender"],
+            fg="black",
+            activebackground=SNES_COLORS["purple"],
+            activeforeground="white",
             relief="flat",
             padx=10,
             pady=6,
         )
-        self.refresh_button.pack(side="left")
+        self.refresh_button.pack(side="left", padx=(0, 6))
+
+        self.standings_button = tk.Button(
+            row,
+            text="Standings",
+            command=self.display_standings,
+            bg=SNES_COLORS["lavender"],
+            fg="black",
+            activebackground=SNES_COLORS["purple"],
+            activeforeground="white",
+            relief="flat",
+            padx=10,
+            pady=6,
+        )
+        self.standings_button.pack(side="left", padx=(6, 0))
 
         # Status line to keep the user informed.
         self.status_label = tk.Label(
@@ -378,6 +414,10 @@ class HuddleApp:
             self.team_data = parsed
             names = sorted(parsed.keys())
             self._populate_dropdown(names)
+            if self.showing_standings:
+                self.display_standings()
+            else:
+                self.display_selected_team()
             self._set_status("Standings refreshed from ESPN.")
         else:
             # Keep existing data (likely the fallback) and warn the user.
@@ -393,6 +433,7 @@ class HuddleApp:
 
     def display_selected_team(self) -> None:
         """Render the selected team's numbers in the output text box."""
+        self.showing_standings = False
         team_name = self.selected_team.get()
         team_stats = self.team_data.get(team_name)
 
@@ -432,13 +473,97 @@ class HuddleApp:
 
         self._set_status(f"Showing data for {team_name}.")
 
+    def display_standings(self) -> None:
+        """List conference standings (1-16) with division breakdowns side by side."""
+        self.showing_standings = True
+        if not self.team_data:
+            self._set_status("No standings available; try refreshing.")
+            return
+
+        conferences: dict[str, list[tuple[str, dict]]] = {}
+        divisions: dict[str, list[tuple[str, dict]]] = {}
+        for team, data in self.team_data.items():
+            conference = data.get("conference") or "Unknown Conference"
+            conferences.setdefault(conference, []).append((team, data))
+            division = data.get("division") or "Unknown Division"
+            divisions.setdefault(division, []).append((team, data))
+
+        def sort_key(item: tuple[str, dict]) -> tuple:
+            team, data = item
+            rank = data.get("conference_rank")
+            win_pct = data.get("win_pct")
+            try:
+                win_pct_val = float(win_pct) if win_pct is not None else 0.0
+            except (TypeError, ValueError):
+                win_pct_val = 0.0
+            wins = data.get("wins") or 0
+            losses = data.get("losses")
+            losses_val = losses if losses is not None else 0
+            return (
+                0 if rank is not None else 1,  # Put ranked teams first.
+                rank if rank is not None else 999,
+                -win_pct_val,
+                -wins,
+                losses_val,
+                team,
+            )
+
+        timestamp = datetime.now().strftime("%Y-%m-%d %I:%M %p")
+        left_lines = ["Conference Standings", ""]
+        for conference in sorted(conferences.keys()):
+            left_lines.append(f"{conference} Standings")
+            sorted_teams = sorted(conferences[conference], key=sort_key)
+            for idx, (team, data) in enumerate(sorted_teams, start=1):
+                seed = data.get("conference_rank") or idx
+                left_lines.append(f"{seed}. {team} ({data.get('record', 'N/A')})")
+            left_lines.append("")  # Spacer between conferences.
+        if left_lines and left_lines[-1] == "":
+            left_lines.pop()
+
+        division_order = [
+            "AFC East",
+            "AFC North",
+            "AFC South",
+            "AFC West",
+            "NFC East",
+            "NFC North",
+            "NFC South",
+            "NFC West",
+        ]
+        extras = [d for d in sorted(divisions.keys()) if d not in division_order]
+        right_lines = ["Division Standings", ""]
+        for division in division_order + extras:
+            teams = divisions.get(division)
+            if not teams:
+                continue
+            right_lines.append(division)
+            sorted_division = sorted(teams, key=sort_key)
+            for idx, (team, data) in enumerate(sorted_division, start=1):
+                right_lines.append(f"{idx}. {team} ({data.get('record', 'N/A')})")
+            right_lines.append("")
+        if right_lines and right_lines[-1] == "":
+            right_lines.pop()
+
+        col_width = 42
+        combined_lines = [f"Current as of: {timestamp}", ""]
+        max_lines = max(len(left_lines), len(right_lines))
+        for i in range(max_lines):
+            left = left_lines[i] if i < len(left_lines) else ""
+            right = right_lines[i] if i < len(right_lines) else ""
+            combined_lines.append(f"{left.ljust(col_width)}{right}")
+
+        self.output.config(state="normal")
+        self.output.delete("1.0", tk.END)
+        self.output.insert("1.0", "\n".join(combined_lines))
+        self.output.config(state="disabled")
+
+        self._set_status("Showing conference standings.")
+
 
 def main() -> None:
     """Entry point that launches the Tkinter event loop."""
     root = tk.Tk()
     app = HuddleApp(root)
-    # Immediately show the first team's data so the screen is not empty.
-    app.display_selected_team()
     root.mainloop()
 
 
