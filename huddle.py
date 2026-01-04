@@ -98,43 +98,38 @@ def fetch_json(url: str, timeout: int = 10) -> dict:
     return json.loads(raw_bytes.decode("utf-8"))
 
 
-def _collect_entries(node: dict) -> list:
+def _collect_entries(node: dict | list) -> list:
     """
-    Walk the standings payload and return the first list of 'entries' found.
+    Walk the standings payload and return every list of 'entries' found.
 
     ESPN wraps standings differently over time (sometimes under "children",
     other times under "standings"). This recursive search keeps the parser
-    resilient to small schema shifts.
+    resilient to small schema shifts and collects entries across conferences
+    instead of stopping after the first 16 teams.
     """
+    # Allow callers to pass either dicts or lists; treat lists as containers.
+    if isinstance(node, list):
+        entries = []
+        for item in node:
+            entries.extend(_collect_entries(item))
+        return entries
+
     if not isinstance(node, dict):
         return []
 
-    # If this node already has 'entries', we are done.
+    entries = []
+
+    # If this node already has 'entries', gather them but continue searching
+    # because other branches (e.g., another conference) may contain more teams.
     if "entries" in node and isinstance(node["entries"], list):
-        return node["entries"]
+        entries.extend(node["entries"])
 
-    # Sometimes standings are nested inside a 'standings' dict.
-    if "standings" in node:
-        entries = _collect_entries(node["standings"])
-        if entries:
-            return entries
-
-    # Other common wrappers: children, groups, leagues, conferences, divisions.
-    for key in ("children", "groups", "leagues", "conferences", "divisions"):
+    # Common wrappers: standings, children, groups, leagues, conferences, divisions.
+    for key in ("standings", "children", "groups", "leagues", "conferences", "divisions"):
         if key in node:
-            container = node[key]
-            if isinstance(container, list):
-                for child in container:
-                    entries = _collect_entries(child)
-                    if entries:
-                        return entries
-            elif isinstance(container, dict):
-                entries = _collect_entries(container)
-                if entries:
-                    return entries
+            entries.extend(_collect_entries(node[key]))
 
-    # Nothing found at this level.
-    return []
+    return entries
 
 
 def parse_standings(raw_payload: dict) -> dict:
@@ -145,8 +140,18 @@ def parse_standings(raw_payload: dict) -> dict:
     entries = _collect_entries(raw_payload)
     parsed = {}
 
+    seen_ids = set()
+
     for entry in entries:
         team = entry.get("team", {})
+        team_id = team.get("id")
+
+        # Avoid duplicates when the payload lists teams under multiple parents.
+        if team_id:
+            if team_id in seen_ids:
+                continue
+            seen_ids.add(team_id)
+
         display_name = (
             team.get("displayName")
             or " ".join(filter(None, [team.get("location"), team.get("name")])).strip()
