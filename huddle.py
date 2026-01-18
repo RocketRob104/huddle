@@ -79,6 +79,44 @@ TEAM_METADATA = {
     "Seattle Seahawks": {"conference": "NFC", "division": "NFC West"},
 }
 
+# First season for each modern franchise so the year dropdown can run back
+# to the true start of the organization.
+FRANCHISE_START_YEARS = {
+    "Arizona Cardinals": 1920,
+    "Atlanta Falcons": 1966,
+    "Baltimore Ravens": 1996,
+    "Buffalo Bills": 1960,
+    "Carolina Panthers": 1995,
+    "Chicago Bears": 1920,
+    "Cincinnati Bengals": 1968,
+    "Cleveland Browns": 1946,
+    "Dallas Cowboys": 1960,
+    "Denver Broncos": 1960,
+    "Detroit Lions": 1930,
+    "Green Bay Packers": 1921,
+    "Houston Texans": 2002,
+    "Indianapolis Colts": 1953,
+    "Jacksonville Jaguars": 1995,
+    "Kansas City Chiefs": 1960,
+    "Las Vegas Raiders": 1960,
+    "Los Angeles Chargers": 1960,
+    "Los Angeles Rams": 1937,
+    "Miami Dolphins": 1966,
+    "Minnesota Vikings": 1961,
+    "New England Patriots": 1960,
+    "New Orleans Saints": 1967,
+    "New York Giants": 1925,
+    "New York Jets": 1960,
+    "Philadelphia Eagles": 1933,
+    "Pittsburgh Steelers": 1933,
+    "San Francisco 49ers": 1946,
+    "Seattle Seahawks": 1976,
+    "Tampa Bay Buccaneers": 1976,
+    "Tennessee Titans": 1960,
+    "Washington Commanders": 1932,
+}
+EARLIEST_FRANCHISE_YEAR = min(FRANCHISE_START_YEARS.values())
+
 # A fallback list of teams so the dropdown always has content even when offline.
 # Performance numbers are intentionally empty so we do not mislead with stale data.
 FALLBACK_TEAM_DATA = {
@@ -110,6 +148,18 @@ def fetch_json(url: str, timeout: int = 10) -> dict:
     with urlopen(url, timeout=timeout) as response:
         raw_bytes = response.read()
     return json.loads(raw_bytes.decode("utf-8"))
+
+
+def current_season_year(today: datetime | None = None) -> int:
+    """Return the season year that most likely represents the current NFL season."""
+    now = today or datetime.now()
+    # NFL seasons start in early fall, so before July we assume the prior season.
+    return now.year if now.month >= 7 else now.year - 1
+
+
+def standings_url_for_year(season_year: int) -> str:
+    """Build the ESPN standings endpoint for a specific season year."""
+    return f"{TEAM_STANDINGS_URL}?season={season_year}&seasontype=2"
 
 
 def _collect_entries(node: dict | list, conference: str | None = None) -> list[tuple[dict, str | None]]:
@@ -240,19 +290,25 @@ class HuddleApp:
 
         # Tkinter variables give us two-way binding between code and widgets.
         self.selected_team = tk.StringVar()
+        self.selected_year = tk.StringVar()
         self.status_text = tk.StringVar(value="Loading fallback teams...")
 
         # Data cache: team name -> performance dict.
         self.team_data = dict(FALLBACK_TEAM_DATA)
+        self.team_data_by_year: dict[int, dict] = {}
+        self.active_fetches: set[int] = set()
+        self.current_year = current_season_year()
         self.showing_standings = False
 
         # Build the interface before we hit the network so the app feels snappy.
         self._build_layout()
-        self._populate_dropdown(sorted(self.team_data.keys()))
+        self._populate_dropdown(sorted(TEAM_METADATA.keys()))
+        self._update_year_dropdown(self.selected_team.get())
+        self._set_current_year_data(self._get_selected_year() or self.current_year)
         self.display_standings()
 
         # Kick off a background fetch so the UI thread never blocks.
-        self._start_background_fetch()
+        self._start_background_fetch(self.current_year)
 
     # ------------------------------------------------------------
     # UI construction helpers
@@ -311,12 +367,29 @@ class HuddleApp:
             style="Snes.TCombobox",
         )
         self.team_dropdown.pack(side="left", padx=(0, 10))
-        self.team_dropdown.bind("<<ComboboxSelected>>", lambda event: self.display_selected_team())
+        self.team_dropdown.bind("<<ComboboxSelected>>", lambda event: self._on_team_change())
+
+        tk.Label(
+            row,
+            text="Year:",
+            font=("Helvetica", 11, "bold"),
+            bg=SNES_COLORS["light_gray"],
+        ).pack(side="left", padx=(0, 6))
+
+        self.year_dropdown = ttk.Combobox(
+            row,
+            textvariable=self.selected_year,
+            state="readonly",
+            width=8,
+            style="Snes.TCombobox",
+        )
+        self.year_dropdown.pack(side="left", padx=(0, 10))
+        self.year_dropdown.bind("<<ComboboxSelected>>", lambda event: self._on_year_change())
 
         self.refresh_button = tk.Button(
             row,
             text="Refresh Data",
-            command=self._start_background_fetch,
+            command=lambda: self._start_background_fetch(force=True),
             bg=SNES_COLORS["lavender"],
             fg="black",
             activebackground=SNES_COLORS["purple"],
@@ -373,6 +446,65 @@ class HuddleApp:
         if team_names:
             self.selected_team.set(team_names[0])
 
+    def _populate_year_dropdown(self, years: list[int], selected_year: int | None = None) -> None:
+        """Load season years into the dropdown, preferring the provided year."""
+        year_strings = [str(year) for year in years]
+        self.year_dropdown["values"] = year_strings
+        if not years:
+            return
+        if selected_year is None or selected_year not in years:
+            selected_year = years[0]
+        self.selected_year.set(str(selected_year))
+
+    def _get_selected_year(self) -> int | None:
+        """Return the year from the dropdown, if one is selected."""
+        try:
+            return int(self.selected_year.get())
+        except (TypeError, ValueError):
+            return None
+
+    def _years_for_team(self, team_name: str) -> list[int]:
+        """Generate a descending list of valid years for the selected franchise."""
+        start_year = FRANCHISE_START_YEARS.get(team_name, EARLIEST_FRANCHISE_YEAR)
+        return list(range(self.current_year, start_year - 1, -1))
+
+    def _update_year_dropdown(self, team_name: str) -> None:
+        """Refresh year dropdown values when a team changes."""
+        years = self._years_for_team(team_name)
+        current_year = self._get_selected_year()
+        if current_year is None or current_year not in years:
+            current_year = self.current_year if self.current_year in years else years[0]
+        self._populate_year_dropdown(years, current_year)
+
+    def _set_current_year_data(self, year: int) -> None:
+        """Update the active dataset to match the currently selected year."""
+        if year in self.team_data_by_year:
+            self.team_data = self.team_data_by_year[year]
+        else:
+            self.team_data = dict(FALLBACK_TEAM_DATA)
+
+    def _on_team_change(self) -> None:
+        """Handle team dropdown changes by adjusting year range and output."""
+        self._update_year_dropdown(self.selected_team.get())
+        self.showing_standings = False
+        self._refresh_current_view(fetch_if_missing=True)
+
+    def _on_year_change(self) -> None:
+        """Handle year dropdown changes by fetching data and refreshing output."""
+        self.showing_standings = False
+        self._refresh_current_view(fetch_if_missing=True)
+
+    def _refresh_current_view(self, fetch_if_missing: bool = False) -> None:
+        """Refresh the display based on the selected team/year."""
+        year = self._get_selected_year() or self.current_year
+        if fetch_if_missing and year not in self.team_data_by_year:
+            self._start_background_fetch(year)
+        self._set_current_year_data(year)
+        if self.showing_standings:
+            self.display_standings()
+        else:
+            self.display_selected_team()
+
     def _set_status(self, message: str) -> None:
         """Small helper to update the status label."""
         self.status_text.set(message)
@@ -380,21 +512,31 @@ class HuddleApp:
     # ------------------------------------------------------------
     # Data fetching and UI updates
     # ------------------------------------------------------------
-    def _start_background_fetch(self) -> None:
+    def _start_background_fetch(self, year: int | None = None, force: bool = False) -> None:
         """
         Spawn a thread to fetch live data. This prevents the GUI from freezing
         while waiting on the network.
         """
+        fetch_year = year or self._get_selected_year() or self.current_year
+        if not force and fetch_year in self.team_data_by_year:
+            return
+        if fetch_year in self.active_fetches:
+            return
+        self.active_fetches.add(fetch_year)
         # Disable the refresh button to avoid overlapping requests.
         self.refresh_button.config(state="disabled")
-        self._set_status("Fetching latest standings from ESPN...")
+        self._set_status(f"Fetching standings for {fetch_year} from ESPN...")
 
-        threading.Thread(target=self._fetch_and_apply_data, daemon=True).start()
+        threading.Thread(
+            target=self._fetch_and_apply_data,
+            args=(fetch_year,),
+            daemon=True,
+        ).start()
 
-    def _fetch_and_apply_data(self) -> None:
+    def _fetch_and_apply_data(self, year: int) -> None:
         """Worker thread: fetch data, parse it, then hand it back to the UI."""
         try:
-            payload = fetch_json(TEAM_STANDINGS_URL)
+            payload = fetch_json(standings_url_for_year(year))
             parsed = parse_standings(payload)
             if not parsed:
                 raise ValueError("Standings payload missing expected fields.")
@@ -406,36 +548,42 @@ class HuddleApp:
             error_msg = ""
 
         # Move back onto the Tk thread to touch widgets.
-        self.root.after(0, lambda: self._apply_new_data(parsed, error_msg))
+        self.root.after(0, lambda: self._apply_new_data(year, parsed, error_msg))
 
-    def _apply_new_data(self, parsed: dict | None, error_msg: str) -> None:
+    def _apply_new_data(self, year: int, parsed: dict | None, error_msg: str) -> None:
         """Update widgets after a background fetch completes."""
+        is_selected_year = year == (self._get_selected_year() or self.current_year)
         if parsed:
-            self.team_data = parsed
-            names = sorted(parsed.keys())
-            self._populate_dropdown(names)
-            if self.showing_standings:
-                self.display_standings()
-            else:
-                self.display_selected_team()
-            self._set_status("Standings refreshed from ESPN.")
+            self.team_data_by_year[year] = parsed
+            if is_selected_year:
+                self.team_data = parsed
+                if self.showing_standings:
+                    self.display_standings()
+                else:
+                    self.display_selected_team()
+                self._set_status(f"Standings refreshed for {year}.")
         else:
             # Keep existing data (likely the fallback) and warn the user.
-            self._set_status(
-                "Using offline fallback data. Connect to the internet and press 'Refresh Data'."
-            )
-            if error_msg:
-                # Show a dialog sparingly so it does not spam the user.
-                messagebox.showwarning("HUDDLE", f"Could not fetch live data.\n\n{error_msg}")
+            if is_selected_year:
+                self._set_status(
+                    f"Using offline fallback data for {year}. "
+                    "Connect to the internet and press 'Refresh Data'."
+                )
+                if error_msg:
+                    # Show a dialog sparingly so it does not spam the user.
+                    messagebox.showwarning("HUDDLE", f"Could not fetch live data.\n\n{error_msg}")
 
+        self.active_fetches.discard(year)
         # Re-enable the refresh button now that the fetch is done.
-        self.refresh_button.config(state="normal")
+        if not self.active_fetches:
+            self.refresh_button.config(state="normal")
 
     def display_selected_team(self) -> None:
         """Render the selected team's numbers in the output text box."""
         self.showing_standings = False
         team_name = self.selected_team.get()
         team_stats = self.team_data.get(team_name)
+        season_year = self._get_selected_year() or self.current_year
 
         if not team_stats:
             # This should not happen, but guard against it.
@@ -450,6 +598,7 @@ class HuddleApp:
         # Build display lines. Simple strings keep this readable.
         lines = [
             f"Team: {team_name}",
+            f"Season: {season_year}",
             f"Record: {team_stats.get('record', 'N/A')}",
             f"Wins: {team_stats.get('wins', 'N/A')} | "
             f"Losses: {team_stats.get('losses', 'N/A')} | "
@@ -471,7 +620,7 @@ class HuddleApp:
         self.output.insert("1.0", "\n".join(lines))
         self.output.config(state="disabled")
 
-        self._set_status(f"Showing data for {team_name}.")
+        self._set_status(f"Showing data for {team_name} ({season_year}).")
 
     def display_standings(self) -> None:
         """List conference standings (1-16) with division breakdowns side by side."""
@@ -479,6 +628,7 @@ class HuddleApp:
         if not self.team_data:
             self._set_status("No standings available; try refreshing.")
             return
+        season_year = self._get_selected_year() or self.current_year
 
         conferences: dict[str, list[tuple[str, dict]]] = {}
         divisions: dict[str, list[tuple[str, dict]]] = {}
@@ -509,7 +659,7 @@ class HuddleApp:
             )
 
         timestamp = datetime.now().strftime("%Y-%m-%d %I:%M %p")
-        left_lines = ["Conference Standings", ""]
+        left_lines = [f"Conference Standings ({season_year})", ""]
         for conference in sorted(conferences.keys()):
             left_lines.append(f"{conference} Standings")
             sorted_teams = sorted(conferences[conference], key=sort_key)
@@ -545,7 +695,7 @@ class HuddleApp:
             right_lines.pop()
 
         col_width = 42
-        combined_lines = [f"Current as of: {timestamp}", ""]
+        combined_lines = [f"Season: {season_year}", f"Current as of: {timestamp}", ""]
         max_lines = max(len(left_lines), len(right_lines))
         for i in range(max_lines):
             left = left_lines[i] if i < len(left_lines) else ""
@@ -557,7 +707,7 @@ class HuddleApp:
         self.output.insert("1.0", "\n".join(combined_lines))
         self.output.config(state="disabled")
 
-        self._set_status("Showing conference standings.")
+        self._set_status(f"Showing conference standings for {season_year}.")
 
 
 def main() -> None:
