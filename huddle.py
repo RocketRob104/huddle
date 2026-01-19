@@ -1008,14 +1008,12 @@ class HuddleApp:
             lines.append("No roster entries found.")
             return lines
 
-        header = "Pos   Player                     Age  Ht/Wt    Exp   College             Status"
+        header = "Pos   #   Player                  Age  Ht/Wt    Exp   College             Status"
         lines.append(header)
         for player in roster:
             pos = self._truncate_text(player.get("positions") or "N/A", 6)
-            name = player.get("name") or "N/A"
-            if player.get("jersey"):
-                name = f"{name} #{player.get('jersey')}"
-            name = self._truncate_text(name, 26)
+            jersey = self._truncate_text(player.get("jersey") or "N/A", 3)
+            name = self._truncate_text(player.get("name") or "N/A", 22)
             age = self._truncate_text(player.get("age") or "N/A", 3)
             height = player.get("height") or "N/A"
             weight = player.get("weight") or "N/A"
@@ -1024,7 +1022,7 @@ class HuddleApp:
             college = self._truncate_text(player.get("college") or "N/A", 19)
             status = self._truncate_text(player.get("status") or "N/A", 10)
             lines.append(
-                f"{pos.ljust(6)} {name.ljust(26)} {age.ljust(3)}  "
+                f"{pos.ljust(6)} {jersey.rjust(2)}  {name.ljust(22)} {age.ljust(3)}  "
                 f"{size.ljust(9)} {exp.ljust(5)} {college.ljust(19)} {status}"
             )
 
