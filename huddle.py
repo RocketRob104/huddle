@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 import tkinter as tk
 from tkinter import ttk, messagebox
@@ -25,6 +26,13 @@ from urllib.request import urlopen
 # ESPN offers a free standings endpoint that does not require an API key.
 # We only read public standings, so the app stays lightweight and dependency-free.
 TEAM_STANDINGS_URL = "https://site.web.api.espn.com/apis/v2/sports/football/nfl/standings"
+TEAM_ROSTER_URL = (
+    "https://sports.core.api.espn.com/v2/sports/football/leagues/nfl/"
+    "seasons/{season_year}/teams/{team_id}/athletes"
+)
+ROSTER_PAGE_LIMIT = 200
+_COLLEGE_CACHE: dict[str, str] = {}
+_COLLEGE_CACHE_LOCK = threading.Lock()
 
 # SNES hardware-inspired palette. These colors echo the North American console:
 # a neutral gray shell with purple buttons and lavender highlights.
@@ -133,6 +141,7 @@ FALLBACK_TEAM_DATA = {
         "conference": meta["conference"],
         "division": meta["division"],
         "conference_rank": None,
+        "team_id": None,
     }
     for name, meta in TEAM_METADATA.items()
 }
@@ -160,6 +169,125 @@ def current_season_year(today: datetime | None = None) -> int:
 def standings_url_for_year(season_year: int) -> str:
     """Build the ESPN standings endpoint for a specific season year."""
     return f"{TEAM_STANDINGS_URL}?season={season_year}&seasontype=2"
+
+
+def roster_url_for_team(team_id: str, season_year: int) -> str:
+    """Build the ESPN roster endpoint for a specific team and season year."""
+    return (
+        f"{TEAM_ROSTER_URL.format(team_id=team_id, season_year=season_year)}"
+        f"?limit={ROSTER_PAGE_LIMIT}"
+    )
+
+
+def _normalize_ref_url(url: str) -> str:
+    """Ensure ESPN ref URLs use https."""
+    if url.startswith("http://"):
+        return "https://" + url[len("http://") :]
+    return url
+
+
+def _get_cached_college(ref: str) -> str | None:
+    """Return a cached college name if available."""
+    with _COLLEGE_CACHE_LOCK:
+        return _COLLEGE_CACHE.get(ref)
+
+
+def _set_cached_college(ref: str, name: str) -> None:
+    """Cache a college name for future roster fetches."""
+    with _COLLEGE_CACHE_LOCK:
+        _COLLEGE_CACHE[ref] = name
+
+
+def _extract_college_ref(college_info: object) -> str | None:
+    """Pull the college ref URL from an athlete record."""
+    if isinstance(college_info, dict):
+        ref = college_info.get("$ref")
+        if isinstance(ref, str):
+            return _normalize_ref_url(ref)
+    return None
+
+
+def _populate_college_names(athletes: list[dict]) -> None:
+    """Fill missing college names using lightweight, cached lookups."""
+    refs_to_fetch: dict[str, str | None] = {}
+    for athlete in athletes:
+        college_info = athlete.get("college")
+        if isinstance(college_info, str):
+            continue
+        if isinstance(college_info, dict) and college_info.get("name"):
+            continue
+        ref = _extract_college_ref(college_info)
+        if not ref:
+            continue
+        cached = _get_cached_college(ref)
+        if cached:
+            refs_to_fetch[ref] = cached
+        else:
+            refs_to_fetch.setdefault(ref, None)
+
+    refs = [ref for ref, name in refs_to_fetch.items() if name is None]
+    if refs:
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            future_map = {executor.submit(fetch_json, ref): ref for ref in refs}
+            for future in as_completed(future_map):
+                ref = future_map[future]
+                try:
+                    payload = future.result()
+                except (HTTPError, URLError, TimeoutError, json.JSONDecodeError):
+                    continue
+                name = payload.get("name") or payload.get("shortDisplayName") or payload.get("displayName")
+                if name:
+                    refs_to_fetch[ref] = name
+                    _set_cached_college(ref, name)
+
+    for athlete in athletes:
+        college_info = athlete.get("college")
+        if isinstance(college_info, dict) and college_info.get("name"):
+            continue
+        ref = _extract_college_ref(college_info)
+        if not ref:
+            continue
+        name = refs_to_fetch.get(ref)
+        if name:
+            athlete["college"] = {"name": name}
+
+
+def fetch_roster_payload(team_id: str, season_year: int) -> dict:
+    """Fetch and assemble roster data for a specific team and season."""
+    roster_index = fetch_json(roster_url_for_team(team_id, season_year))
+    items = roster_index.get("items")
+    if not isinstance(items, list):
+        raise ValueError("Roster index missing athlete items.")
+
+    refs: list[str] = []
+    athletes: list[dict] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        ref = item.get("$ref")
+        if ref:
+            refs.append(_normalize_ref_url(ref))
+        else:
+            athletes.append(item)
+
+    if refs:
+        results: list[dict | None] = [None] * len(refs)
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            future_map = {executor.submit(fetch_json, ref): idx for idx, ref in enumerate(refs)}
+            for future in as_completed(future_map):
+                idx = future_map[future]
+                try:
+                    results[idx] = future.result()
+                except (HTTPError, URLError, TimeoutError, json.JSONDecodeError):
+                    results[idx] = None
+        athletes.extend([entry for entry in results if entry])
+
+    if not athletes:
+        raise ValueError("Roster index returned no athletes.")
+
+    _populate_college_names(athletes)
+
+    return {"athletes": athletes}
 
 
 def _collect_entries(node: dict | list, conference: str | None = None) -> list[tuple[dict, str | None]]:
@@ -268,10 +396,180 @@ def parse_standings(raw_payload: dict) -> dict:
             "conference": conference or meta.get("conference"),
             "division": meta.get("division"),
             "conference_rank": conference_rank,
+            "team_id": str(team_id) if team_id is not None else None,
         }
 
     # Returning an empty dict signals to the caller that parsing failed.
     return parsed
+
+
+def _extract_roster_entries(raw_payload: dict) -> list[tuple[dict, str | None]] | None:
+    """
+    Pull roster entries from the ESPN payload and preserve any position group labels.
+
+    Returns None when the payload shape is not recognized.
+    """
+    if not isinstance(raw_payload, dict):
+        return None
+
+    roster_payload = raw_payload.get("roster")
+    team_payload = raw_payload.get("team")
+    if isinstance(roster_payload, dict):
+        data = roster_payload
+    elif isinstance(team_payload, dict):
+        data = team_payload
+    else:
+        data = raw_payload
+
+    athletes = data.get("athletes")
+    if isinstance(athletes, list):
+        entries: list[tuple[dict, str | None]] = []
+        for group in athletes:
+            if not isinstance(group, dict):
+                continue
+            items = group.get("items")
+            if isinstance(items, list):
+                position = group.get("position") or {}
+                position_label = None
+                if isinstance(position, dict):
+                    position_label = position.get("abbreviation") or position.get("name")
+                for athlete in items:
+                    if isinstance(athlete, dict):
+                        entries.append((athlete, position_label))
+            else:
+                entries.append((group, None))
+        return entries
+
+    for key in ("items", "entries", "players"):
+        items = data.get(key)
+        if isinstance(items, list):
+            return [(item, None) for item in items if isinstance(item, dict)]
+
+    return None
+
+
+def _format_height(value: object) -> str | None:
+    """Format a height value into a friendly string when possible."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value.strip()
+    try:
+        inches = int(value)
+    except (TypeError, ValueError):
+        return str(value)
+    feet = inches // 12
+    remainder = inches % 12
+    return f"{feet}'{remainder}\""
+
+
+def _format_weight(value: object) -> str | None:
+    """Format a weight value into a friendly string when possible."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        trimmed = value.strip()
+        if trimmed.isdigit():
+            return f"{trimmed} lb"
+        return trimmed
+    try:
+        pounds = int(value)
+    except (TypeError, ValueError):
+        return str(value)
+    return f"{pounds} lb"
+
+
+def _format_experience(value: object) -> str | None:
+    """Normalize experience values into a readable string."""
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        years = value.get("years")
+        display = value.get("displayValue") or value.get("display")
+        if years is None and display:
+            return str(display)
+        value = years
+    try:
+        years_int = int(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if years_int == 0:
+        return "Rookie"
+    suffix = "yr" if years_int == 1 else "yrs"
+    return f"{years_int} {suffix}"
+
+
+def parse_roster(raw_payload: dict) -> list[dict] | None:
+    """
+    Convert the ESPN roster JSON into a list of player dictionaries.
+
+    Each player record includes name, positions, and a few quick stats.
+    """
+    entries = _extract_roster_entries(raw_payload)
+    if entries is None:
+        return None
+
+    roster = []
+    for athlete, position_group in entries:
+        if not isinstance(athlete, dict):
+            continue
+
+        name = (
+            athlete.get("fullName")
+            or athlete.get("displayName")
+            or athlete.get("shortName")
+            or " ".join(filter(None, [athlete.get("firstName"), athlete.get("lastName")])).strip()
+        )
+        if not name:
+            name = "Unknown Player"
+
+        position_info = athlete.get("position") or {}
+        if isinstance(position_info, dict):
+            position_label = position_info.get("abbreviation") or position_info.get("name")
+        else:
+            position_label = None
+
+        positions = [pos for pos in (position_group, position_label) if pos]
+        positions_seen = []
+        for pos in positions:
+            if pos not in positions_seen:
+                positions_seen.append(pos)
+        positions_text = "/".join(positions_seen) if positions_seen else None
+
+        jersey = athlete.get("jersey") or athlete.get("jerseyNumber")
+        age = athlete.get("age")
+        height = _format_height(athlete.get("displayHeight") or athlete.get("height"))
+        weight = _format_weight(athlete.get("displayWeight") or athlete.get("weight"))
+        experience = _format_experience(athlete.get("experience"))
+
+        college = None
+        college_info = athlete.get("college")
+        if isinstance(college_info, dict):
+            college = college_info.get("name")
+        elif isinstance(college_info, str):
+            college = college_info
+
+        status_info = athlete.get("status")
+        if isinstance(status_info, dict):
+            status = status_info.get("name") or status_info.get("type")
+        else:
+            status = status_info
+
+        roster.append(
+            {
+                "name": name,
+                "positions": positions_text,
+                "jersey": str(jersey) if jersey is not None else None,
+                "age": age,
+                "height": height,
+                "weight": weight,
+                "experience": experience,
+                "college": college,
+                "status": status,
+            }
+        )
+
+    return roster
 
 
 class HuddleApp:
@@ -297,6 +595,9 @@ class HuddleApp:
         self.team_data = dict(FALLBACK_TEAM_DATA)
         self.team_data_by_year: dict[int, dict] = {}
         self.active_fetches: set[int] = set()
+        self.roster_data_by_year: dict[int, dict[str, list[dict]]] = {}
+        self.roster_errors_by_year: dict[int, dict[str, str]] = {}
+        self.active_roster_fetches: set[tuple[int, str]] = set()
         self.current_year = current_season_year()
         self.showing_standings = False
 
@@ -389,7 +690,7 @@ class HuddleApp:
         self.refresh_button = tk.Button(
             row,
             text="Refresh Data",
-            command=lambda: self._start_background_fetch(force=True),
+            command=self._refresh_current_selection,
             bg=SNES_COLORS["lavender"],
             fg="black",
             activebackground=SNES_COLORS["purple"],
@@ -426,9 +727,15 @@ class HuddleApp:
         self.status_label.pack(fill="x", pady=(0, 10))
 
         # Text area where results are shown.
+        output_frame = tk.Frame(content, bg=SNES_COLORS["light_gray"])
+        output_frame.pack(fill="both", expand=True)
+
+        scrollbar = tk.Scrollbar(output_frame)
+        scrollbar.pack(side="right", fill="y")
+
         self.output = tk.Text(
-            content,
-            height=12,
+            output_frame,
+            height=16,
             bg=SNES_COLORS["lavender"],
             fg="black",
             font=("Courier New", 11),
@@ -437,8 +744,10 @@ class HuddleApp:
             pady=12,
             state="disabled",  # Prevent user edits.
             wrap="word",
+            yscrollcommand=scrollbar.set,
         )
         self.output.pack(fill="both", expand=True)
+        scrollbar.config(command=self.output.yview)
 
     def _populate_dropdown(self, team_names: list[str]) -> None:
         """Load team names into the dropdown and select the first by default."""
@@ -504,6 +813,17 @@ class HuddleApp:
             self.display_standings()
         else:
             self.display_selected_team()
+
+    def _refresh_current_selection(self) -> None:
+        """Force-refresh standings and roster data for the current selection."""
+        year = self._get_selected_year() or self.current_year
+        self._start_background_fetch(year, force=True)
+        team_name = self.selected_team.get()
+        team_stats = self.team_data.get(team_name) or {}
+        team_id = team_stats.get("team_id")
+        if team_id:
+            self.roster_errors_by_year.get(year, {}).pop(team_id, None)
+            self._start_roster_fetch(team_id, team_name, year, force=True)
 
     def _set_status(self, message: str) -> None:
         """Small helper to update the status label."""
@@ -578,6 +898,138 @@ class HuddleApp:
         if not self.active_fetches:
             self.refresh_button.config(state="normal")
 
+    def _get_roster_for_team(self, team_id: str, year: int) -> list[dict] | None:
+        """Return roster data for the team/year if already cached."""
+        return self.roster_data_by_year.get(year, {}).get(team_id)
+
+    def _get_roster_error(self, team_id: str, year: int) -> str | None:
+        """Return the last roster error for the team/year, if any."""
+        return self.roster_errors_by_year.get(year, {}).get(team_id)
+
+    def _start_roster_fetch(
+        self,
+        team_id: str,
+        team_name: str,
+        year: int,
+        force: bool = False,
+    ) -> None:
+        """Fetch roster data in a background thread."""
+        if not team_id:
+            return
+        if not force:
+            if self._get_roster_for_team(team_id, year) is not None:
+                return
+            if self._get_roster_error(team_id, year):
+                return
+        key = (year, team_id)
+        if key in self.active_roster_fetches:
+            return
+
+        self.active_roster_fetches.add(key)
+        self._set_status(f"Fetching roster for {team_name} ({year}) from ESPN...")
+        threading.Thread(
+            target=self._fetch_and_apply_roster,
+            args=(team_id, team_name, year),
+            daemon=True,
+        ).start()
+
+    def _fetch_and_apply_roster(self, team_id: str, team_name: str, year: int) -> None:
+        """Worker thread: fetch roster data, parse it, then hand it back to the UI."""
+        try:
+            payload = fetch_roster_payload(team_id, year)
+            roster = parse_roster(payload)
+            if roster is None:
+                raise ValueError("Roster payload missing expected fields.")
+        except (HTTPError, URLError, TimeoutError, ValueError, json.JSONDecodeError) as exc:
+            roster = None
+            error_msg = f"Roster fetch failed: {exc}"
+        else:
+            error_msg = ""
+
+        self.root.after(0, lambda: self._apply_new_roster(team_id, team_name, year, roster, error_msg))
+
+    def _apply_new_roster(
+        self,
+        team_id: str,
+        team_name: str,
+        year: int,
+        roster: list[dict] | None,
+        error_msg: str,
+    ) -> None:
+        """Update widgets after a roster fetch completes."""
+        is_selected_year = year == (self._get_selected_year() or self.current_year)
+        if is_selected_year:
+            current_team = self.selected_team.get()
+            current_stats = self.team_data.get(current_team) or {}
+            is_selected_year = current_stats.get("team_id") == team_id
+
+        if roster is not None:
+            self.roster_data_by_year.setdefault(year, {})[team_id] = roster
+            self.roster_errors_by_year.get(year, {}).pop(team_id, None)
+            if is_selected_year and not self.showing_standings:
+                self.display_selected_team()
+            self._set_status(f"Roster updated for {team_name} ({year}).")
+        else:
+            self.roster_errors_by_year.setdefault(year, {})[team_id] = error_msg or "Roster unavailable."
+            if is_selected_year and not self.showing_standings:
+                self.display_selected_team()
+            self._set_status(f"Roster unavailable for {team_name} ({year}).")
+
+        self.active_roster_fetches.discard((year, team_id))
+
+    def _truncate_text(self, value: object, max_len: int) -> str:
+        """Trim long strings so roster rows stay readable."""
+        text = str(value) if value is not None else "N/A"
+        if len(text) <= max_len:
+            return text
+        if max_len <= 3:
+            return text[:max_len]
+        return f"{text[: max_len - 3]}..."
+
+    def _build_roster_lines(self, team_name: str, team_stats: dict, season_year: int) -> list[str]:
+        """Assemble roster lines for the selected team."""
+        team_id = team_stats.get("team_id")
+        lines = ["", f"Roster ({season_year})"]
+        if not team_id:
+            lines.append("Roster pending: standings must load team IDs.")
+            return lines
+
+        roster = self._get_roster_for_team(team_id, season_year)
+        if roster is None:
+            error_msg = self._get_roster_error(team_id, season_year)
+            if error_msg:
+                lines.append("Roster unavailable. Press 'Refresh Data' to retry.")
+            else:
+                lines.append("Roster is loading...")
+                self._start_roster_fetch(team_id, team_name, season_year)
+            return lines
+
+        if not roster:
+            lines.append("No roster entries found.")
+            return lines
+
+        header = "Pos   Player                     Age  Ht/Wt    Exp   College             Status"
+        lines.append(header)
+        for player in roster:
+            pos = self._truncate_text(player.get("positions") or "N/A", 6)
+            name = player.get("name") or "N/A"
+            if player.get("jersey"):
+                name = f"{name} #{player.get('jersey')}"
+            name = self._truncate_text(name, 26)
+            age = self._truncate_text(player.get("age") or "N/A", 3)
+            height = player.get("height") or "N/A"
+            weight = player.get("weight") or "N/A"
+            size = self._truncate_text(f"{height}/{weight}", 9)
+            exp = self._truncate_text(player.get("experience") or "N/A", 5)
+            college = self._truncate_text(player.get("college") or "N/A", 19)
+            status = self._truncate_text(player.get("status") or "N/A", 10)
+            lines.append(
+                f"{pos.ljust(6)} {name.ljust(26)} {age.ljust(3)}  "
+                f"{size.ljust(9)} {exp.ljust(5)} {college.ljust(19)} {status}"
+            )
+
+        return lines
+
     def display_selected_team(self) -> None:
         """Render the selected team's numbers in the output text box."""
         self.showing_standings = False
@@ -613,6 +1065,8 @@ class HuddleApp:
         note = team_stats.get("note")
         if note:
             lines.append(f"Note: {note}")
+
+        lines.extend(self._build_roster_lines(team_name, team_stats, season_year))
 
         # Update the text widget safely.
         self.output.config(state="normal")
